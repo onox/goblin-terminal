@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2020 onox <denkpadje@gmail.com>
+
+import os
+import sys
+
+import gi
+gi.require_version('Gdk', '3.0')
+gi.require_version('Gtk', '3.0')
+gi.require_version('Vte', '2.91')
+from gi.repository import GLib, Gdk, Gtk, Vte, Gio
+
+
+class AppWindow(Gtk.ApplicationWindow):
+
+    app_title = "Phosphorescent Goblin"
+    app_version = "1.0"
+    app_icon_name = "utilities-terminal"
+
+    default_label  = "Terminal"
+
+    default_width  = 640
+    default_height = 480
+
+    default_scrollback_lines = 10_000
+    default_zoom_scale = 1.0
+
+    @staticmethod
+    def create_icon_button(icon_name, on_clicked):
+        button = Gtk.Button.new_from_icon_name(icon_name, Gtk.IconSize.MENU)
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.connect("clicked", on_clicked)
+        button.show_all()
+        return button
+
+    @staticmethod
+    def create_tab_header(label, on_close_cb):
+        assert label is not None
+        close_button = AppWindow.create_icon_button("window-close-symbolic", on_close_cb)
+
+        tab = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, expand=True)
+        tab.pack_start(Gtk.Label(label), True, True, 0)
+        tab.pack_end(close_button, False, False, 0)
+        tab.show_all()
+
+        return tab
+
+    def __init__(self, application):
+        Gtk.ApplicationWindow.__init__(self, application=application)
+
+        self.__application = application
+        self.__is_fullscreen = False
+        self.__zoom_scale = AppWindow.default_zoom_scale
+
+        self.set_title(AppWindow.app_title)
+        self.set_icon_name(AppWindow.app_icon_name)
+        self.set_default_size(AppWindow.default_width, AppWindow.default_height)
+
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_scrollable(True)
+        self.notebook.connect("switch-page", self.on_switch_page)
+        self.add(self.notebook)
+
+        # Create a button at the end of the list of tabs
+        def on_new_tab(button):
+            self.do_add_terminal()
+        create_tab_button = AppWindow.create_icon_button("tab-new-symbolic", on_new_tab)
+        self.notebook.set_action_widget(create_tab_button, Gtk.PackType.END)
+
+        # Create about dialog
+        self.__about_dialog = Gtk.AboutDialog(parent=self)
+        self.__about_dialog.set_program_name(AppWindow.app_title)
+        self.__about_dialog.set_logo_icon_name(AppWindow.app_icon_name)
+        self.__about_dialog.set_version(AppWindow.app_version)
+        self.__about_dialog.set_comments("A mutated clone of GNOME Terminal")
+        self.__about_dialog.set_website("https://github.com/onox/goblin-terminal")
+        self.__about_dialog.set_authors(["onox"])
+        self.__about_dialog.set_copyright("Copyright © 2020 onox")
+        self.__about_dialog.set_license_type(Gtk.License.MIT_X11)
+
+        # Create popup menu
+        self.__popup_menu = Gtk.Menu()
+
+        def append_menu_item(menu, label, callback=lambda: None):
+            def on_activate(item):
+                callback()
+            item = Gtk.MenuItem(label, use_underline=True)
+            item.connect("activate", on_activate)
+            menu.append(item)
+
+        def append_menu(parent, label, menu):
+            item = Gtk.MenuItem(label, use_underline=True)
+            item.set_submenu(menu)
+            parent.append(item)
+
+        def append_check_menu_item(menu, label, callback):
+            def on_toggled(item):
+                callback()
+            item = Gtk.CheckMenuItem(label, use_underline=True)
+            item.connect("toggled", on_toggled)
+            menu.append(item)
+
+        append_menu_item(self.__popup_menu, "_Copy", self.do_copy_text)
+        append_menu_item(self.__popup_menu, "_Paste", self.do_paste_text)
+        self.__popup_menu.append(Gtk.SeparatorMenuItem())
+
+        view_menu = Gtk.Menu()
+        append_check_menu_item(view_menu, "_Full Screen", self.do_toggle_fullscreen)
+        append_menu_item(view_menu, "zoom _In", self.do_zoom_in)
+        append_menu_item(view_menu, "_Normal Size", self.do_zoom_reset)
+        append_menu_item(view_menu, "Zoom _Out", self.do_zoom_out)
+        append_menu(self.__popup_menu, "_View", view_menu)
+        self.__popup_menu.append(Gtk.SeparatorMenuItem())
+
+        append_menu_item(self.__popup_menu, "New _Window", self.__application.activate)
+        append_menu_item(self.__popup_menu, "New _Tab", self.do_add_terminal)
+        self.__popup_menu.append(Gtk.SeparatorMenuItem())
+
+        append_menu_item(self.__popup_menu, "About", self.show_about_dialog)
+
+        self.__popup_menu.show_all()
+
+        # Create at least one terminal
+        self.do_add_terminal()
+
+    @property
+    def __get_terminal_current_tab(self):
+        return self.notebook.get_nth_page(self.notebook.get_current_page())
+
+    def __update_zoom_scale_current_tab(self):
+        self.__get_terminal_current_tab.set_font_scale(self.__zoom_scale)
+
+    def __set_current_tab(self, index):
+        self.notebook.set_current_page(index)
+        self.__update_zoom_scale_current_tab()
+
+    def show_about_dialog(self):
+        self.__about_dialog.show_all()
+
+    def do_toggle_fullscreen(self):
+        if not self.__is_fullscreen:
+            self.fullscreen()
+        else:
+            self.unfullscreen()
+        self.__is_fullscreen = not self.__is_fullscreen
+
+    def do_zoom_in(self):
+        self.__zoom_scale = min(self.__zoom_scale + 0.5, 4.0)
+        self.__update_zoom_scale_current_tab()
+
+    def do_zoom_out(self):
+        self.__zoom_scale = max(self.__zoom_scale - 0.5, 1.0)
+        self.__update_zoom_scale_current_tab()
+
+    def do_zoom_reset(self):
+        self.__zoom_scale = AppWindow.default_zoom_scale
+        self.__update_zoom_scale_current_tab()
+
+    def do_switch_previous_tab(self):
+        prev_page = self.notebook.get_current_page() - 1
+        self.__set_current_tab(prev_page % self.notebook.get_n_pages())
+
+    def do_switch_next_tab(self):
+        next_page = self.notebook.get_current_page() + 1
+        self.__set_current_tab(next_page % self.notebook.get_n_pages())
+
+    def switch_tab(self, index):
+        assert 0 <= index <= 9
+        self.__set_current_tab(index - 1 if index > 0 else 9)
+
+    def do_copy_text(self):
+        self.__get_terminal_current_tab.copy_clipboard_format(Vte.Format.TEXT)
+
+    def do_paste_text(self):
+        self.__get_terminal_current_tab.paste_clipboard()
+
+    def do_add_terminal(self):
+        terminal = Vte.Terminal()
+        terminal.set_allow_hyperlink(True)
+        terminal.set_audible_bell(True)
+        terminal.set_scrollback_lines(AppWindow.default_scrollback_lines)
+#        terminal.set_pty(Vte.Pty.new_sync(Vte.PtyFlags.DEFAULT))
+
+        spawn_success, child_pid = terminal.spawn_sync(
+            Vte.PtyFlags.DEFAULT, None, [os.environ["SHELL"]], None,
+            GLib.SpawnFlags.DO_NOT_REAP_CHILD
+        )
+
+        if not spawn_success:
+            return
+
+        terminal.connect("window-title-changed", self.on_window_title_changed)
+        terminal.connect("child-exited", self.on_child_exited)
+        terminal.connect_after("button-press-event", self.on_button_press_event)
+
+        terminal.watch_child(child_pid)
+
+        def close_tab(button):
+            print("how close terminal?", self.notebook.page_num(terminal))
+
+        header = AppWindow.create_tab_header(AppWindow.default_label, close_tab)
+        self.notebook.append_page(terminal, header)
+
+        self.__show_tabs_if_multiple()
+        self.notebook.show_all()
+        self.__set_current_tab(self.notebook.get_n_pages() - 1)
+
+    def remove_terminal(self, terminal):
+        index = self.notebook.page_num(terminal)
+
+        if index is None:
+            return
+
+        self.notebook.remove_page(index)
+        self.__show_tabs_if_multiple()
+
+    def __show_tabs_if_multiple(self):
+        self.notebook.set_show_tabs(self.notebook.get_n_pages() > 1)
+
+    def on_switch_page(self, notebook, child, index):
+        """Notebook signal"""
+        self.set_title(child.get_window_title() or AppWindow.default_label)
+
+    def on_window_title_changed(self, terminal):
+        """Terminal signal"""
+        def close_tab(button):
+            print("close terminal for real?", self.notebook.page_num(terminal))
+
+        title = terminal.get_window_title()
+        header = AppWindow.create_tab_header(title, close_tab)
+        self.notebook.set_tab_label(terminal, header)
+
+        if self.notebook.get_current_page() == self.notebook.page_num(terminal):
+            self.set_title(title)
+
+    def on_child_exited(self, terminal, status):
+        """Terminal signal"""
+        self.remove_terminal(terminal)
+
+        if not self.notebook.get_n_pages():
+            self.destroy()
+            self.__application.remove_window(self)
+
+    def on_button_press_event(self, terminal, event):
+        """Terminal signal"""
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
+            self.__popup_menu.popup_at_pointer(event)
+
+
+def on_activate(app):
+    """Application signal"""
+    window = AppWindow(application=app)
+    app.add_window(window)
+    window.show_all()
+
+    def add_action(name, callback):
+        def on_activate(action, params):
+            callback()
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", on_activate)
+        window.add_action(action)
+
+    add_action("create-terminal", window.do_add_terminal)
+    add_action("create-window", app.activate)
+    add_action("toggle-fullscreen", window.do_toggle_fullscreen)
+    add_action("previous-tab", window.do_switch_previous_tab)
+    add_action("next-tab", window.do_switch_next_tab)
+
+    add_action("copy-text", window.do_copy_text)
+    add_action("paste-text", window.do_paste_text)
+
+    add_action("zoom-in", window.do_zoom_in)
+    add_action("zoom-out", window.do_zoom_out)
+    add_action("zoom-reset", window.do_zoom_reset)
+
+    def on_switch_tab(action, params, user_data):
+        window.switch_tab(user_data)
+
+    for i in range(10):
+        action = Gio.SimpleAction.new("switch-tab-{:d}".format(i), None)
+        action.connect("activate", on_switch_tab, i)
+        window.add_action(action)
+
+
+if __name__ == "__main__":
+    app = Gtk.Application(application_id="com.github.onox.terminal")
+    app.connect("activate", on_activate)
+
+    app.set_accels_for_action("win.create-terminal", ("<Ctrl><Shift>T", None))
+    app.set_accels_for_action("win.create-window", ("<Ctrl><Shift>N", None))
+    app.set_accels_for_action("win.toggle-fullscreen", ("F11", None))
+
+    app.set_accels_for_action("win.previous-tab", ("<Ctrl>Page_Up", None))
+    app.set_accels_for_action("win.next-tab", ("<Ctrl>Page_Down", None))
+
+    app.set_accels_for_action("win.switch-tab-0", ("<Alt>0", None))
+    app.set_accels_for_action("win.switch-tab-1", ("<Alt>1", None))
+    app.set_accels_for_action("win.switch-tab-2", ("<Alt>2", None))
+    app.set_accels_for_action("win.switch-tab-3", ("<Alt>3", None))
+    app.set_accels_for_action("win.switch-tab-4", ("<Alt>4", None))
+    app.set_accels_for_action("win.switch-tab-5", ("<Alt>5", None))
+    app.set_accels_for_action("win.switch-tab-6", ("<Alt>6", None))
+    app.set_accels_for_action("win.switch-tab-7", ("<Alt>7", None))
+    app.set_accels_for_action("win.switch-tab-8", ("<Alt>8", None))
+    app.set_accels_for_action("win.switch-tab-9", ("<Alt>9", None))
+
+    app.set_accels_for_action("win.copy-text", ("<Ctrl><Shift>C", None))
+    app.set_accels_for_action("win.paste-text", ("<Ctrl><Shift>V", None))
+
+    app.set_accels_for_action("win.zoom-in", ("<Ctrl>equal", None))
+    app.set_accels_for_action("win.zoom-out", ("<Ctrl>minus", None))
+    app.set_accels_for_action("win.zoom-reset", ("<Ctrl>0", None))
+
+    app.run(sys.argv)
+
+    # TO DO:
+    # - Add Ctrl+Shift+W: Close Tab
+    #    --> Dialog: Close this terminal?
+    #                There is still a process running in this terminal. Closing the terminal will kill it. [Cancel] [Close Terminal]
+    # - Add Ctrl+Shift+Q: Close Window
+    #    --> Dialog: Close this window?
+    #                There are still processes running in some terminals in this window. Closing the window will kill all of them. [Cancel] [Close Window]
+    # - Fix killing terminal via close button
